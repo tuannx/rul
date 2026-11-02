@@ -16,6 +16,7 @@ median of repeated runs on the same machine
 | llama2.c `run.c`, `-O3 -march=native` | 69.4 | 68.5, 69.4, 69.4 |
 | llama2.c `runomp` config (`-Ofast -fopenmp -march=native`, 4 threads) | 55.8 | 59.9, 41.5, 55.8 |
 | **Rul (this fork, Tier 1)** | **64.0** | 63.5, 64.0, 62.4, 66.2, 66.0 |
+| Rul + `MatVecT` no-copy cache read (below) | **66.9** | 67.8, 65.8, 66.9, 66.9, 67.4, 63.4 |
 
 So the Rul graph runtime lands at **~89% of hand-written C** on the
 C program's own benchmark — despite two handicaps stated plainly:
@@ -56,3 +57,29 @@ this tokenizer.bin stores literal-space pieces, not U+2581).
   cached keys are stored pre-rotated, so attention inside the graph
   is unchanged). Everything else — attention, output projection,
   both norms, FFN, classifier — runs inside Rul graphs.
+
+## Where the time goes (profiled, 256 tokens, `RUL_PROFILE=1`)
+
+| phase | ms/token | share |
+|---|---|---|
+| Rul graph execution | 12.9 | 83% |
+| host q/k/v projections + RoPE | 1.4 | 9% |
+| graph assembly (text `.rls` per step) | 0.69 | 4.4% |
+| V^T transpose copies | 0.46 | 2.9% |
+
+A bare-loop micro-benchmark of the same matvecs streams weights at
+~9.2 GB/s on this VM; the pure-matvec floor is ~13.3 ms/token
+(~75 tok/s). In other words **~85% of the runtime is irreducible
+f64 weight streaming** (122 MB read per token) — no-copy work can
+only reclaim the remaining ~15%.
+
+First slice of that work, measured: opcode **`MatVecT` (0x25)**
+computes `W^T . x` over the row-major cache directly, so the V
+cache is read in its append layout with **zero transpose copies**:
+66.9 vs 64.0 tok/s median (**+4.5%**), ids unchanged (256/256).
+Remaining identified overhead: operand clones inside the evaluator
+(~0.9 ms/token) and text-program assembly (~0.65 ms/token) — together
+worth roughly another +8-10%, up to the ~75 tok/s streaming floor.
+Beyond that floor, only fewer bytes per weight (an fp32/int8 lane)
+or more memory bandwidth can help; llama2.c's own OpenMP build shows
+threads do not add bandwidth on this VM.

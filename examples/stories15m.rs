@@ -62,11 +62,48 @@ fn matvec(w: &[f64], x: &[f64], rows: usize, cols: usize) -> Vec<f64> {
 }
 
 fn run_column(program: &rul::bytecode::RulProgram, inputs: &[&[f64]]) -> Vec<f64> {
+    let t0 = Instant::now();
     let rep = execute_tier1_stencil(program, inputs).expect("execute");
+    prof_add(&PROF_EXEC, t0);
     match rep.output {
         RuntimeValue::ColumnF64(c) => c,
         other => panic!("expected column output, got {other:?}"),
     }
+}
+
+// Phase profiling (RUL_PROFILE=1): nanoseconds accumulated per phase.
+static PROF_EXEC: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static PROF_ASM: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static PROF_HOST: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static PROF_VT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+fn prof_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("RUL_PROFILE").is_some())
+}
+
+fn prof_add(slot: &std::sync::atomic::AtomicU64, t0: Instant) {
+    if prof_enabled() {
+        slot.fetch_add(
+            t0.elapsed().as_nanos() as u64,
+            std::sync::atomic::Ordering::Relaxed,
+        );
+    }
+}
+
+fn prof_report(tokens: usize) {
+    if !prof_enabled() {
+        return;
+    }
+    let g = |s: &std::sync::atomic::AtomicU64| {
+        s.load(std::sync::atomic::Ordering::Relaxed) as f64 / 1e6
+    };
+    let (exec, asm, host, vt) = (g(&PROF_EXEC), g(&PROF_ASM), g(&PROF_HOST), g(&PROF_VT));
+    println!(
+        "profile over {tokens} tokens: graph-exec {exec:.1} ms, assemble {asm:.1} ms, \
+         host qkv+rope {host:.1} ms, VT transpose {:.1} ms (inside host+exec window)",
+        vt
+    );
 }
 
 /// RMSNorm graph: arenas 0=x (d,), 1=gamma (d,) -> y (d,).
@@ -133,7 +170,7 @@ fn block_rls(t: usize) -> String {
         a += 1;
     }
     for h in 0..H {
-        input(&mut s, &format!("$vt{h}"), a);
+        input(&mut s, &format!("$v{h}"), a);
         a += 1;
     }
     for h in 0..H {
@@ -202,8 +239,8 @@ fn block_rls(t: usize) -> String {
         node(
             &mut s,
             &format!("$o{h}"),
-            "MatVec",
-            &format!("$vt{h}"),
+            "MatVecT",
+            &format!("$v{h}"),
             &format!("$at{h}"),
         );
         node(
@@ -336,6 +373,7 @@ fn main() {
         let t = pos + 1;
         for l in 0..L {
             let y = run_column(&rms_prog, &[x.as_slice(), w.t(&format!("l{l}_rms_att"))]);
+            let th = Instant::now();
             // host: full q/k/v projections with the layer's matrices
             // (rebuilt from per-head blocks in the manifest order)
             let mut q = vec![0.0f64; D];
@@ -367,7 +405,10 @@ fn main() {
                 cache_k[l][h].extend_from_slice(&knew[h * HD..(h + 1) * HD]);
                 cache_v[l][h].extend_from_slice(&vnew[h * HD..(h + 1) * HD]);
             }
+            prof_add(&PROF_HOST, th);
+            let ta = Instant::now();
             let prog = assemble_rls(&block_rls(t)).expect("assemble block");
+            prof_add(&PROF_ASM, ta);
             let mut inputs: Vec<&[f64]> = vec![x.as_slice()];
             for h in 0..H {
                 inputs.push(&q[h * HD..(h + 1) * HD]);
@@ -375,18 +416,10 @@ fn main() {
             for kh in &cache_k[l] {
                 inputs.push(kh.as_slice());
             }
-            let mut vt_bufs: Vec<Vec<f64>> = Vec::with_capacity(H);
+            // No V^T transpose copy: MatVecT reads the append-layout
+            // cache directly (position-major rows).
             for v in &cache_v[l] {
-                let mut vt = vec![0.0f64; HD * t];
-                for i in 0..t {
-                    for j in 0..HD {
-                        vt[j * t + i] = v[i * HD + j];
-                    }
-                }
-                vt_bufs.push(vt);
-            }
-            for vt in &vt_bufs {
-                inputs.push(vt.as_slice());
+                inputs.push(v.as_slice());
             }
             for h in 0..H {
                 inputs.push(w.t(&format!("l{l}_wo{h}")));
@@ -435,6 +468,7 @@ fn main() {
         logits = process_token(pos, next, &w, &mut cache_k, &mut cache_v);
     }
     let elapsed = t_start.elapsed();
+    prof_report(ids.len());
     let matched = ids
         .iter()
         .zip(ref_ids.iter())
