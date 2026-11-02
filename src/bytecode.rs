@@ -58,6 +58,8 @@ pub enum Opcode {
     CmpLt = 0x18,
     /// Branchless elementwise equality comparison (`mask[i] = a[i] == b[i]`).
     CmpEq = 0x19,
+    /// Elementwise natural exponential (`out[i] = exp(in_a[i])`).
+    Exp = 0x1A,
     /// Stream compaction filtering elements of `in_b` where mask `in_a` is true.
     FilterCompact = 0x20,
     /// Horizontal sum reduction of column `in_a` to a scalar `f64`.
@@ -66,6 +68,9 @@ pub enum Opcode {
     ReduceMax = 0x22,
     /// Indirect indexed gather (`out[i] = arena_node[index_node[i]]`, requires `proof_idx > 0`).
     Gather = 0x23,
+    /// Dense matrix-vector product (`out[r] = sum_c W[r * C + c] * x[c]`, where
+    /// `in_a` is a row-major `R x C` matrix column and `in_b` is a length-`C` vector).
+    MatVec = 0x24,
     /// Enqueue scalar/column output to a hardware NIC ring (requires [`CAP_NET_RING`]).
     RingEnqueue = 0x30,
     /// Output contract assertion checking non-NaN and finite bounds on `in_a`.
@@ -93,10 +98,12 @@ impl Opcode {
             0x17 => Ok(Self::Max),
             0x18 => Ok(Self::CmpLt),
             0x19 => Ok(Self::CmpEq),
+            0x1A => Ok(Self::Exp),
             0x20 => Ok(Self::FilterCompact),
             0x21 => Ok(Self::ReduceSum),
             0x22 => Ok(Self::ReduceMax),
             0x23 => Ok(Self::Gather),
+            0x24 => Ok(Self::MatVec),
             0x30 => Ok(Self::RingEnqueue),
             0x40 => Ok(Self::AssertContract),
             other => Err(RulFormatError::UnknownOpcode(other)),

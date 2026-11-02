@@ -86,6 +86,13 @@ pub enum VerifyErrorKind {
         /// Shape of `in_b`.
         right: ValueShape,
     },
+    /// `MatVec` weight column length is not a positive multiple of the input vector length.
+    InvalidMatVecShape {
+        /// Length of the weight column (expected `rows * input_len`).
+        weights_len: u32,
+        /// Length of the input vector (matrix column count).
+        input_len: u32,
+    },
     /// Incompatible element type (`ElemType`) for the operation.
     ElementTypeMismatch {
         /// Expected element type.
@@ -552,6 +559,65 @@ fn verify_node_semantics(
             }
             Ok(NodeMeta {
                 shape: ValueShape::Scalar,
+                elem: ElemType::F64,
+                origin_arena: None,
+            })
+        }
+        Opcode::Exp => {
+            let src_meta = get_prior_meta(node_idx, frame.in_a, metas)?;
+            if src_meta.elem != ElemType::F64 {
+                return Err(VerifyDiagnostic {
+                    node_idx,
+                    kind: VerifyErrorKind::ElementTypeMismatch {
+                        expected: ElemType::F64,
+                        actual: src_meta.elem,
+                    },
+                });
+            }
+            Ok(NodeMeta {
+                shape: src_meta.shape,
+                elem: ElemType::F64,
+                origin_arena: None,
+            })
+        }
+        Opcode::MatVec => {
+            let w_meta = get_prior_meta(node_idx, frame.in_a, metas)?;
+            let x_meta = get_prior_meta(node_idx, frame.in_b, metas)?;
+            if w_meta.elem != ElemType::F64 || x_meta.elem != ElemType::F64 {
+                return Err(VerifyDiagnostic {
+                    node_idx,
+                    kind: VerifyErrorKind::ElementTypeMismatch {
+                        expected: ElemType::F64,
+                        actual: if w_meta.elem != ElemType::F64 {
+                            w_meta.elem
+                        } else {
+                            x_meta.elem
+                        },
+                    },
+                });
+            }
+            let (ValueShape::Column(w_len), ValueShape::Column(x_len)) =
+                (w_meta.shape, x_meta.shape)
+            else {
+                return Err(VerifyDiagnostic {
+                    node_idx,
+                    kind: VerifyErrorKind::ShapeMismatch {
+                        left: w_meta.shape,
+                        right: x_meta.shape,
+                    },
+                });
+            };
+            if x_len == 0 || w_len == 0 || w_len % x_len != 0 {
+                return Err(VerifyDiagnostic {
+                    node_idx,
+                    kind: VerifyErrorKind::InvalidMatVecShape {
+                        weights_len: w_len,
+                        input_len: x_len,
+                    },
+                });
+            }
+            Ok(NodeMeta {
+                shape: ValueShape::Column(w_len / x_len),
                 elem: ElemType::F64,
                 origin_arena: None,
             })
