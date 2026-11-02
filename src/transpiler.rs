@@ -923,6 +923,9 @@ fn format_type_lane(lane: TypeLane) -> &'static str {
         (ElemType::I64, SimdWidth::Scalar) => "i64x1",
         (ElemType::I64, SimdWidth::Lane4) => "i64x4",
         (ElemType::I64, SimdWidth::Lane8) => "i64x8",
+        (ElemType::F32, SimdWidth::Scalar) => "f32x1",
+        (ElemType::F32, SimdWidth::Lane4) => "f32x4",
+        (ElemType::F32, SimdWidth::Lane8) => "f32x8",
         (ElemType::BoolMask, SimdWidth::Scalar) => "maskx1",
         (ElemType::BoolMask, SimdWidth::Lane4) => "maskx4",
         (ElemType::BoolMask, SimdWidth::Lane8) => "maskx8",
@@ -937,6 +940,12 @@ fn parse_type_lane(line_no: usize, raw: &str) -> Result<TypeLane, RlsError> {
             width: SimdWidth::Lane4,
         },
         "f64x8" => TypeLane::F64X8,
+        "f32x1" | "f32" => TypeLane::F32_SCALAR,
+        "f32x4" => TypeLane {
+            elem: ElemType::F32,
+            width: SimdWidth::Lane4,
+        },
+        "f32x8" => TypeLane::F32X8,
         "i64x1" | "i64" => TypeLane {
             elem: ElemType::I64,
             width: SimdWidth::Scalar,

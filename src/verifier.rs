@@ -583,16 +583,15 @@ fn verify_node_semantics(
         Opcode::MatVec | Opcode::MatVecT => {
             let w_meta = get_prior_meta(node_idx, frame.in_a, metas)?;
             let x_meta = get_prior_meta(node_idx, frame.in_b, metas)?;
-            if w_meta.elem != ElemType::F64 || x_meta.elem != ElemType::F64 {
+            // Weights may use the F32 storage lane (widened during the
+            // product); the vector operand and the result stay F64.
+            let w_ok = matches!(w_meta.elem, ElemType::F64 | ElemType::F32);
+            if !w_ok || x_meta.elem != ElemType::F64 {
                 return Err(VerifyDiagnostic {
                     node_idx,
                     kind: VerifyErrorKind::ElementTypeMismatch {
                         expected: ElemType::F64,
-                        actual: if w_meta.elem != ElemType::F64 {
-                            w_meta.elem
-                        } else {
-                            x_meta.elem
-                        },
+                        actual: if !w_ok { w_meta.elem } else { x_meta.elem },
                     },
                 });
             }

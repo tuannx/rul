@@ -130,6 +130,10 @@ pub enum ElemType {
     I64 = 0x2,
     /// Predication boolean mask (`bool` / lane mask).
     BoolMask = 0x3,
+    /// 32-bit IEEE-754 float (`f32`). Storage-only lane: values may be
+    /// consumed by `MatVec`/`MatVecT` as weights and are widened to
+    /// `f64` during the product; all other computation stays `f64`.
+    F32 = 0x4,
 }
 
 /// SIMD vector lane width encoded in the low nibble of [`TypeLane`].
@@ -166,6 +170,18 @@ impl TypeLane {
         width: SimdWidth::Scalar,
     };
 
+    /// Standard 8-lane `f32` storage type (`f32x8`).
+    pub const F32X8: Self = Self {
+        elem: ElemType::F32,
+        width: SimdWidth::Lane8,
+    };
+
+    /// Standard scalar `f32` storage type (`f32x1`).
+    pub const F32_SCALAR: Self = Self {
+        elem: ElemType::F32,
+        width: SimdWidth::Scalar,
+    };
+
     /// Standard 8-lane boolean mask type (`maskx8`).
     pub const MASKX8: Self = Self {
         elem: ElemType::BoolMask,
@@ -193,6 +209,7 @@ impl TypeLane {
             0x1 => ElemType::F64,
             0x2 => ElemType::I64,
             0x3 => ElemType::BoolMask,
+            0x4 => ElemType::F32,
             _ => return Err(RulFormatError::InvalidTypeLane(byte)),
         };
         let width = match byte & 0x0F {

@@ -48,6 +48,38 @@ impl ArenaZoneMap {
     }
 }
 
+/// One arena's runtime input data, in its storage element type.
+///
+/// `F64` is the standard lane. `F32` is the storage lane for
+/// `ElemType::F32` arenas (today only legal as `MatVec`/`MatVecT`
+/// weights): the slice is borrowed zero-copy and each element is
+/// widened to `f64` inside the product loop, so memory traffic is
+/// halved while accumulation stays `f64`.
+#[derive(Debug, Clone, Copy)]
+pub enum InputData<'a> {
+    /// Borrowed `f64` column.
+    F64(&'a [f64]),
+    /// Borrowed `f32` column (storage lane).
+    F32(&'a [f32]),
+}
+
+impl InputData<'_> {
+    /// Number of elements in the column.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        match self {
+            Self::F64(s) => s.len(),
+            Self::F32(s) => s.len(),
+        }
+    }
+
+    /// Whether the column is empty.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+}
+
 /// Runtime value produced by evaluating a node in the `.rl` graph.
 #[derive(Debug, Clone, PartialEq)]
 pub enum RuntimeValue {
@@ -65,6 +97,7 @@ enum EvalValue<'a> {
     Unused,
     Scalar(f64),
     ColumnF64(Cow<'a, [f64]>),
+    ColumnF32(Cow<'a, [f32]>),
     ColumnMask(Vec<bool>),
 }
 
@@ -73,6 +106,11 @@ impl EvalValue<'_> {
         match self {
             Self::Scalar(v) => Ok(RuntimeValue::Scalar(v)),
             Self::ColumnF64(cow) => Ok(RuntimeValue::ColumnF64(cow.into_owned())),
+            // A graph output is never an F32 storage column in a verified
+            // program (F32 may only feed MatVec weights); widen defensively.
+            Self::ColumnF32(cow) => Ok(RuntimeValue::ColumnF64(
+                cow.iter().map(|&v| f64::from(v)).collect(),
+            )),
             Self::ColumnMask(m) => Ok(RuntimeValue::ColumnMask(m)),
             Self::Unused => Err(ExecError::InvalidOperandState(node_idx)),
         }
@@ -121,6 +159,12 @@ pub enum ExecError {
         /// Actual slice length provided.
         actual: usize,
     },
+    /// Input data kind does not match the arena's declared element type
+    /// (`F32` storage arenas require `InputData::F32`, all others `F64`).
+    ArenaTypeMismatch {
+        /// Arena ID.
+        arena_id: u32,
+    },
     /// Invalid operand value type at node index.
     InvalidOperandState(u32),
     /// Indirect `Gather` index violated the proven `[0..bound_hi)` refinement range.
@@ -154,6 +198,12 @@ impl fmt::Display for ExecError {
                 f,
                 "arena #{arena_id} length mismatch: expected {expected}, got {actual}"
             ),
+            Self::ArenaTypeMismatch { arena_id } => {
+                write!(
+                    f,
+                    "input data kind does not match arena #{arena_id} element type"
+                )
+            }
             Self::InvalidOperandState(idx) => write!(f, "invalid operand state at node #{idx}"),
             Self::GatherIndexOutOfBounds {
                 node_idx,
@@ -173,22 +223,31 @@ impl fmt::Display for ExecError {
 
 impl std::error::Error for ExecError {}
 
-fn validate_inputs(program: &RulProgram, inputs: &[&[f64]]) -> Result<usize, ExecError> {
+fn validate_inputs(program: &RulProgram, inputs: &[InputData<'_>]) -> Result<usize, ExecError> {
     let mut total_elements = 0usize;
     for desc in &program.arenas {
-        let slice = inputs
+        let data = inputs
             .get(desc.arena_id as usize)
             .copied()
             .ok_or(ExecError::MissingArenaInput(desc.arena_id))?;
         let expected = desc.element_count as usize;
-        if slice.len() != expected {
+        if data.len() != expected {
             return Err(ExecError::ArenaLengthMismatch {
                 arena_id: desc.arena_id,
                 expected,
-                actual: slice.len(),
+                actual: data.len(),
             });
         }
-        total_elements = total_elements.saturating_add(slice.len());
+        let kind_ok = match data {
+            InputData::F32(_) => desc.type_lane.elem == crate::bytecode::ElemType::F32,
+            InputData::F64(_) => desc.type_lane.elem != crate::bytecode::ElemType::F32,
+        };
+        if !kind_ok {
+            return Err(ExecError::ArenaTypeMismatch {
+                arena_id: desc.arena_id,
+            });
+        }
+        total_elements = total_elements.saturating_add(data.len());
     }
     Ok(total_elements)
 }
@@ -287,6 +346,18 @@ pub fn execute_tier0_interpreter(
     program: &RulProgram,
     inputs: &[&[f64]],
 ) -> Result<ExecutionReport, ExecError> {
+    let data: Vec<InputData<'_>> = inputs.iter().map(|s| InputData::F64(s)).collect();
+    execute_tier0_interpreter_data(program, &data)
+}
+
+/// Tier 0 with typed [`InputData`] inputs (supports the F32 storage lane).
+///
+/// # Errors
+/// Returns [`ExecError`] if static verification or execution fails.
+pub fn execute_tier0_interpreter_data(
+    program: &RulProgram,
+    inputs: &[InputData<'_>],
+) -> Result<ExecutionReport, ExecError> {
     let t_verify = Instant::now();
     verify_program(program).map_err(ExecError::VerificationFailed)?;
     let verify_ns = u64::try_from(t_verify.elapsed().as_nanos()).unwrap_or(u64::MAX);
@@ -323,22 +394,96 @@ pub fn execute_tier0_interpreter(
     })
 }
 
+fn matvec_rows(w: &[f64], x: &[f64]) -> Option<Vec<f64>> {
+    let cols = x.len();
+    if cols == 0 || !w.len().is_multiple_of(cols) {
+        return None;
+    }
+    let mut out = Vec::with_capacity(w.len() / cols);
+    for row in w.chunks_exact(cols) {
+        let mut acc = 0.0f64;
+        for (&wi, &xi) in row.iter().zip(x.iter()) {
+            acc += wi * xi;
+        }
+        out.push(acc);
+    }
+    Some(out)
+}
+
+/// `MatVec` with F32 storage-lane weights: elements are widened inside
+/// the product loop, halving weight storage while the accumulation
+/// stays `f64` (bit-identical products to the F64 path when the
+/// weights are exactly F32-representable, e.g. an FP32 checkpoint
+/// stored without conversion). Note: on the benchmark VM this was
+/// measured *slower* than the F64 loop (conversion cost exceeds the
+/// bandwidth saved at ~9 GB/s effective streaming); the lane's value
+/// is footprint, not speed, until a wider-bandwidth target appears.
+fn matvec_rows_f32w(w: &[f32], x: &[f64]) -> Option<Vec<f64>> {
+    let cols = x.len();
+    if cols == 0 || !w.len().is_multiple_of(cols) {
+        return None;
+    }
+    let mut out = Vec::with_capacity(w.len() / cols);
+    for row in w.chunks_exact(cols) {
+        let mut acc = 0.0f64;
+        for (&wi, &xi) in row.iter().zip(x.iter()) {
+            acc += f64::from(wi) * xi;
+        }
+        out.push(acc);
+    }
+    Some(out)
+}
+
+fn matvect_rows(w: &[f64], x: &[f64]) -> Option<Vec<f64>> {
+    let rows = x.len();
+    if rows == 0 || !w.len().is_multiple_of(rows) {
+        return None;
+    }
+    let cols = w.len() / rows;
+    let mut out = vec![0.0f64; cols];
+    for (row, &xr) in w.chunks_exact(cols).zip(x.iter()) {
+        for (o, &wi) in out.iter_mut().zip(row.iter()) {
+            *o += wi * xr;
+        }
+    }
+    Some(out)
+}
+
+/// `MatVecT` with F32 storage-lane weights (see [`matvec_rows_f32w`]).
+fn matvect_rows_f32w(w: &[f32], x: &[f64]) -> Option<Vec<f64>> {
+    let rows = x.len();
+    if rows == 0 || !w.len().is_multiple_of(rows) {
+        return None;
+    }
+    let cols = w.len() / rows;
+    let mut out = vec![0.0f64; cols];
+    for (row, &xr) in w.chunks_exact(cols).zip(x.iter()) {
+        for (dst, &src) in out.iter_mut().zip(row.iter()) {
+            *dst += f64::from(src) * xr;
+        }
+    }
+    Some(out)
+}
+
 fn eval_node_tier0<'a>(
     program: &RulProgram,
     frame: &NodeFrame,
     node_idx: u32,
-    inputs: &[&'a [f64]],
+    inputs: &[InputData<'a>],
     values: &[EvalValue<'a>],
     intermediate_bytes: &mut usize,
 ) -> Result<EvalValue<'a>, ExecError> {
     match frame.opcode {
         Opcode::ArenaInput => {
             // Zero-copy borrow of the input arena slice!
-            let slice = inputs
+            match inputs
                 .get(frame.in_a as usize)
                 .copied()
-                .ok_or(ExecError::MissingArenaInput(frame.in_a))?;
-            Ok(EvalValue::ColumnF64(Cow::Borrowed(slice)))
+                .ok_or(ExecError::MissingArenaInput(frame.in_a))?
+            {
+                InputData::F64(slice) => Ok(EvalValue::ColumnF64(Cow::Borrowed(slice))),
+                InputData::F32(slice) => Ok(EvalValue::ColumnF32(Cow::Borrowed(slice))),
+            }
         }
         Opcode::ConstF64 => Ok(EvalValue::Scalar(frame.decode_const_f64())),
         Opcode::ArenaSlice => {
@@ -508,24 +653,17 @@ fn eval_node_tier0<'a>(
             let x_val = values
                 .get(frame.in_b as usize)
                 .ok_or(ExecError::InvalidOperandState(node_idx))?;
-            if let (EvalValue::ColumnF64(w), EvalValue::ColumnF64(x)) = (w_val, x_val) {
-                let cols = x.len();
-                if cols == 0 || w.len() % cols != 0 {
-                    return Err(ExecError::InvalidOperandState(node_idx));
+            let out = match (w_val, x_val) {
+                (EvalValue::ColumnF64(w), EvalValue::ColumnF64(x)) => matvec_rows(w, x),
+                (EvalValue::ColumnF32(w), EvalValue::ColumnF64(x)) => matvec_rows_f32w(w, x),
+                _ => None,
+            };
+            match out {
+                Some(out) => {
+                    *intermediate_bytes = intermediate_bytes.saturating_add(out.len() * 8);
+                    Ok(EvalValue::ColumnF64(Cow::Owned(out)))
                 }
-                let rows = w.len() / cols;
-                let mut out = Vec::with_capacity(rows);
-                for row in w.chunks_exact(cols) {
-                    let mut acc = 0.0f64;
-                    for (&wi, &xi) in row.iter().zip(x.iter()) {
-                        acc += wi * xi;
-                    }
-                    out.push(acc);
-                }
-                *intermediate_bytes = intermediate_bytes.saturating_add(out.len() * 8);
-                Ok(EvalValue::ColumnF64(Cow::Owned(out)))
-            } else {
-                Err(ExecError::InvalidOperandState(node_idx))
+                None => Err(ExecError::InvalidOperandState(node_idx)),
             }
         }
         Opcode::MatVecT => {
@@ -535,22 +673,17 @@ fn eval_node_tier0<'a>(
             let x_val = values
                 .get(frame.in_b as usize)
                 .ok_or(ExecError::InvalidOperandState(node_idx))?;
-            if let (EvalValue::ColumnF64(w), EvalValue::ColumnF64(x)) = (w_val, x_val) {
-                let rows = x.len();
-                if rows == 0 || w.len() % rows != 0 {
-                    return Err(ExecError::InvalidOperandState(node_idx));
+            let out = match (w_val, x_val) {
+                (EvalValue::ColumnF64(w), EvalValue::ColumnF64(x)) => matvect_rows(w, x),
+                (EvalValue::ColumnF32(w), EvalValue::ColumnF64(x)) => matvect_rows_f32w(w, x),
+                _ => None,
+            };
+            match out {
+                Some(out) => {
+                    *intermediate_bytes = intermediate_bytes.saturating_add(out.len() * 8);
+                    Ok(EvalValue::ColumnF64(Cow::Owned(out)))
                 }
-                let cols = w.len() / rows;
-                let mut out = vec![0.0f64; cols];
-                for (row, &xr) in w.chunks_exact(cols).zip(x.iter()) {
-                    for (o, &wi) in out.iter_mut().zip(row.iter()) {
-                        *o += wi * xr;
-                    }
-                }
-                *intermediate_bytes = intermediate_bytes.saturating_add(out.len() * 8);
-                Ok(EvalValue::ColumnF64(Cow::Owned(out)))
-            } else {
-                Err(ExecError::InvalidOperandState(node_idx))
+                None => Err(ExecError::InvalidOperandState(node_idx)),
             }
         }
         Opcode::Gather => {
@@ -706,6 +839,18 @@ pub fn execute_tier1_stencil(
     program: &RulProgram,
     inputs: &[&[f64]],
 ) -> Result<ExecutionReport, ExecError> {
+    let data: Vec<InputData<'_>> = inputs.iter().map(|s| InputData::F64(s)).collect();
+    execute_tier1_stencil_data(program, &data)
+}
+
+/// Tier 1 with typed [`InputData`] inputs (supports the F32 storage lane).
+///
+/// # Errors
+/// Returns [`ExecError`] if static verification or execution fails.
+pub fn execute_tier1_stencil_data(
+    program: &RulProgram,
+    inputs: &[InputData<'_>],
+) -> Result<ExecutionReport, ExecError> {
     let t_verify = Instant::now();
     verify_program(program).map_err(ExecError::VerificationFailed)?;
     let verify_ns = u64::try_from(t_verify.elapsed().as_nanos()).unwrap_or(u64::MAX);
@@ -764,6 +909,17 @@ pub fn execute_tier2_fused(
     execute_tier2_with_zonemap(program, inputs, None)
 }
 
+/// Tier 2 with typed [`InputData`] inputs (supports the F32 storage lane).
+///
+/// # Errors
+/// Returns [`ExecError`] if static verification or execution fails.
+pub fn execute_tier2_fused_data(
+    program: &RulProgram,
+    inputs: &[InputData<'_>],
+) -> Result<ExecutionReport, ExecError> {
+    execute_tier2_with_zonemap_data(program, inputs, None)
+}
+
 /// Executes **Tier 2** with an optional precomputed [`ArenaZoneMap`] on `Arena(0)` for
 /// sub-arena block skipping.
 ///
@@ -772,6 +928,19 @@ pub fn execute_tier2_fused(
 pub fn execute_tier2_with_zonemap(
     program: &RulProgram,
     inputs: &[&[f64]],
+    zonemap_a0: Option<&ArenaZoneMap>,
+) -> Result<ExecutionReport, ExecError> {
+    let data: Vec<InputData<'_>> = inputs.iter().map(|s| InputData::F64(s)).collect();
+    execute_tier2_with_zonemap_data(program, &data, zonemap_a0)
+}
+
+/// Tier 2 with typed [`InputData`] inputs and an optional zonemap.
+///
+/// # Errors
+/// Returns [`ExecError`] if static verification or execution fails.
+pub fn execute_tier2_with_zonemap_data(
+    program: &RulProgram,
+    inputs: &[InputData<'_>],
     zonemap_a0: Option<&ArenaZoneMap>,
 ) -> Result<ExecutionReport, ExecError> {
     let t_verify = Instant::now();
@@ -783,9 +952,19 @@ pub fn execute_tier2_with_zonemap(
     let t_exec = Instant::now();
     let live = compute_live_nodes(program);
 
+    // The L1 tile kernel reads F64 slices only; a program using the F32
+    // storage lane always contains MatVec/MatVecT and never has a tile
+    // plan, so the guard below only fires for all-F64 inputs in practice.
+    let f64_view: Option<Vec<&[f64]>> = inputs
+        .iter()
+        .map(|d| match d {
+            InputData::F64(slice) => Some(*slice),
+            InputData::F32(_) => None,
+        })
+        .collect();
     // Check if the live DAG is eligible for Zero-Allocation L1-Cache Tile Fusion.
-    if let Some(plan) = build_l1_tile_plan(program, &live) {
-        let scalar_out = execute_l1_tile_plan(program, inputs, &live, &plan, zonemap_a0)?;
+    if let (Some(plan), Some(f64_inputs)) = (build_l1_tile_plan(program, &live), f64_view) {
+        let scalar_out = execute_l1_tile_plan(program, &f64_inputs, &live, &plan, zonemap_a0)?;
         let exec_ns = u64::try_from(t_exec.elapsed().as_nanos()).unwrap_or(u64::MAX);
 
         if plan.has_assert_contract && !scalar_out.is_finite() {
@@ -802,7 +981,7 @@ pub fn execute_tier2_with_zonemap(
     }
 
     // Fallback to dead-node-eliminated Tier 1 for pipelines containing FilterCompact or Gather.
-    execute_tier1_stencil(program, inputs)
+    execute_tier1_stencil_data(program, inputs)
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1790,6 +1969,18 @@ pub fn trace_program(
     program: &RulProgram,
     inputs: &[&[f64]],
 ) -> Result<ProgramTraceReport, ExecError> {
+    let data: Vec<InputData<'_>> = inputs.iter().map(|s| InputData::F64(s)).collect();
+    trace_program_data(program, &data)
+}
+
+/// White-box trace with typed [`InputData`] inputs (F32 storage lane).
+///
+/// # Errors
+/// Returns [`ExecError`] if static verification or node evaluation fails.
+pub fn trace_program_data(
+    program: &RulProgram,
+    inputs: &[InputData<'_>],
+) -> Result<ProgramTraceReport, ExecError> {
     let t_verify = Instant::now();
     verify_program(program).map_err(ExecError::VerificationFailed)?;
     let verify_ns = u64::try_from(t_verify.elapsed().as_nanos()).unwrap_or(u64::MAX);
@@ -1879,6 +2070,43 @@ fn summarize_eval_value(
                 opcode,
                 is_live,
                 value_kind: "ColumnF64",
+                element_count: col.len(),
+                min_val: min_v,
+                max_val: max_v,
+                sum_or_true_count: sum_v,
+                nan_or_inf_count: non_finite,
+                sample_head,
+            }
+        }
+        EvalValue::ColumnF32(col) => {
+            let mut min_v = f64::INFINITY;
+            let mut max_v = f64::NEG_INFINITY;
+            let mut sum_v = 0.0f64;
+            let mut non_finite = 0usize;
+            for &v in col.iter() {
+                let x = f64::from(v);
+                if !x.is_finite() {
+                    non_finite = non_finite.saturating_add(1);
+                } else {
+                    if x < min_v {
+                        min_v = x;
+                    }
+                    if x > max_v {
+                        max_v = x;
+                    }
+                }
+                sum_v += x;
+            }
+            if min_v == f64::INFINITY {
+                min_v = f64::NAN;
+                max_v = f64::NAN;
+            }
+            let sample_head: Vec<f64> = col.iter().take(4).map(|&v| f64::from(v)).collect();
+            NodeTraceEntry {
+                node_idx,
+                opcode,
+                is_live,
+                value_kind: "ColumnF32",
                 element_count: col.len(),
                 min_val: min_v,
                 max_val: max_v,

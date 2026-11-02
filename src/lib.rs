@@ -1310,6 +1310,64 @@ mod tests {
     }
 
     #[test]
+    fn test_f32_storage_lane_matvec_matches_f64() {
+        // F32 storage-lane weights widened inside MatVec must reproduce the
+        // F64 result exactly for F32-representable weights.
+        // W = [[1,2,3],[4,5,6]], x = [1, 0.5, 2] -> o = [8, 18.5] -> sum 26.5
+        let rls = "
+            cap 0x0
+            arena 0 len=6 lane=f32x8 mut=false align=64 ver=1
+            arena 1 len=3 lane=f64x8 mut=false align=64 ver=1
+            node $w = ArenaInput f32x8 fg=1 pol=simd proof=0 tok=read(0,1) a=0 b=0
+            node $x = ArenaInput f64x8 fg=1 pol=simd proof=0 tok=read(1,1) a=1 b=0
+            node $o = MatVec f64x8 fg=1 pol=simd proof=0 tok=pure a=$w b=$x
+            node $s = ReduceSum f64x1 fg=1 pol=simd proof=0 tok=pure a=$o b=0
+            output $s
+        ";
+        let Ok(prog) = crate::transpiler::assemble_rls(rls) else {
+            return;
+        };
+        assert!(verify_program(&prog).is_ok());
+        let w32 = [1.0_f32, 2.0, 3.0, 4.0, 5.0, 6.0];
+        let x = [1.0_f64, 0.5, 2.0];
+        let inputs = [
+            crate::engine::InputData::F32(&w32),
+            crate::engine::InputData::F64(&x),
+        ];
+        let Ok(rep) = crate::engine::execute_tier0_interpreter_data(&prog, &inputs) else {
+            return;
+        };
+        match rep.output {
+            RuntimeValue::Scalar(v) => assert!((v - 26.5).abs() < 1e-12, "got {v}"),
+            other => assert!(
+                matches!(other, RuntimeValue::Scalar(_)),
+                "expected scalar output, got {other:?}"
+            ),
+        }
+        // Kind mismatch (F64 data for an F32 arena) is an execution error.
+        let w64 = [1.0_f64, 2.0, 3.0, 4.0, 5.0, 6.0];
+        let bad = [
+            crate::engine::InputData::F64(&w64),
+            crate::engine::InputData::F64(&x),
+        ];
+        assert!(crate::engine::execute_tier0_interpreter_data(&prog, &bad).is_err());
+        // An F32 column feeding anything but MatVec/MatVecT fails verification.
+        let rls_bad = "
+            cap 0x0
+            arena 0 len=3 lane=f32x8 mut=false align=64 ver=1
+            arena 1 len=3 lane=f64x8 mut=false align=64 ver=1
+            node $w = ArenaInput f32x8 fg=1 pol=simd proof=0 tok=read(0,1) a=0 b=0
+            node $x = ArenaInput f64x8 fg=1 pol=simd proof=0 tok=read(1,1) a=1 b=0
+            node $o = Add f64x8 fg=1 pol=simd proof=0 tok=pure a=$w b=$x
+            output $o
+        ";
+        let Ok(prog_bad) = crate::transpiler::assemble_rls(rls_bad) else {
+            return;
+        };
+        assert!(verify_program(&prog_bad).is_err());
+    }
+
+    #[test]
     fn test_matvec_verifier_rejects_non_multiple_weights() {
         // Weight column of length 5 against a length-2 input: 5 % 2 != 0.
         let rls = "

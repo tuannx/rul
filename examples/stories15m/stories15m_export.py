@@ -89,6 +89,10 @@ for l in range(L):
 
 blob = np.concatenate([a.ravel() for _, a in tensors])
 blob.tofile(os.path.join(OUT, "weights.bin"))
+# F32 storage-lane artifact: the checkpoint is natively FP32, so this
+# cast is exact (halves the file; the engine can consume it directly
+# as MatVec/MatVecT weights via InputData::F32).
+blob.astype("<f4").tofile(os.path.join(OUT, "weights_f32.bin"))
 off = 0
 with open(os.path.join(OUT, "manifest.txt"), "w") as fh:
     for name, a in tensors:
