@@ -83,3 +83,32 @@ worth roughly another +8-10%, up to the ~75 tok/s streaming floor.
 Beyond that floor, only fewer bytes per weight (an fp32/int8 lane)
 or more memory bandwidth can help; llama2.c's own OpenMP build shows
 threads do not add bandwidth on this VM.
+
+## F32 storage lane — built, lossless, and (here) not faster
+
+The fork's ISA now has an F32 storage lane (`ElemType::F32 = 0x4`,
+`lane=f32x8`): an F32 arena may feed only `MatVec`/`MatVecT` as
+weights, elements are widened inside the product loop, accumulation
+stays f64. For this checkpoint the lane is **lossless** — every
+weight is natively FP32, and the runner's step-0 logits diff
+(4.6e-14) and 256/256 greedy ids are unchanged when consuming
+`weights_f32.bin` (98 MB instead of 195 MB).
+
+It is also, measured on this VM, **slower**, and no loop shape fixed
+it. Classifier matvec (32,000x288), ms per call:
+
+| variant | ms |
+|---|---|
+| F64 plain (incumbent) | 8.15–8.30 |
+| F32 storage, widen in loop | 9.57 |
+| F32 storage, widen row/block first | 11.57–11.69 |
+| F32 accumulate | 9.97 |
+| pure F32 compute (x pre-cast) | 7.96 |
+
+End-to-end the F32-lane runner scored 58 tok/s vs 67 for F64.
+Interpretation: at this VM's ~9 GB/s effective streaming the F64
+loop is bound by the load+FMA pipeline, not by byte count, so
+halving bytes buys nothing while conversions cost µops; even pure
+F32 compute gains only ~2%. The lane is kept for its footprint
+halving and because the calculus changes on wider-bandwidth
+hardware — but the benchmark runner deliberately stays on F64.
