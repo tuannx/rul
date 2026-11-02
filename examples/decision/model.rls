@@ -1,0 +1,23 @@
+cap 0x0
+arena 0 len=6 lane=f64x8 mut=false align=64 ver=1
+arena 1 len=96 lane=f64x8 mut=false align=64 ver=1
+arena 2 len=16 lane=f64x8 mut=false align=64 ver=1
+arena 3 len=48 lane=f64x8 mut=false align=64 ver=1
+arena 4 len=3 lane=f64x8 mut=false align=64 ver=1
+node $x = ArenaInput f64x8 fg=1 pol=simd proof=0 tok=read(0,1) a=0 b=0
+node $w1 = ArenaInput f64x8 fg=1 pol=simd proof=0 tok=read(1,1) a=1 b=0
+node $b1 = ArenaInput f64x8 fg=1 pol=simd proof=0 tok=read(2,1) a=2 b=0
+node $w2 = ArenaInput f64x8 fg=1 pol=simd proof=0 tok=read(3,1) a=3 b=0
+node $b2 = ArenaInput f64x8 fg=1 pol=simd proof=0 tok=read(4,1) a=4 b=0
+node $h1 = MatVec f64x8 fg=1 pol=simd proof=0 tok=pure a=$w1 b=$x
+node $h1b = Add f64x8 fg=1 pol=simd proof=0 tok=pure a=$h1 b=$b1
+node $zero = ConstF64 f64x1 fg=1 pol=simd proof=0 tok=pure const=0.0
+node $h = Max f64x8 fg=1 pol=simd proof=0 tok=pure a=$h1b b=$zero
+node $s = MatVec f64x8 fg=1 pol=simd proof=0 tok=pure a=$w2 b=$h
+node $sb = Add f64x8 fg=1 pol=simd proof=0 tok=pure a=$s b=$b2
+node $e = Exp f64x8 fg=1 pol=simd proof=0 tok=pure a=$sb b=0
+node $es = ReduceSum f64x1 fg=1 pol=simd proof=0 tok=pure a=$e b=0
+node $p = Div f64x8 fg=1 pol=simd proof=0 tok=pure a=$e b=$es
+node $conf = ReduceMax f64x1 fg=1 pol=simd proof=0 tok=pure a=$p b=0
+node $out = AssertContract f64x1 fg=1 pol=simd proof=0 tok=pure a=$conf b=0
+output $out

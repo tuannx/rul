@@ -1,0 +1,9 @@
+{
+ "numpy_test_accuracy": 0.9375,
+ "n_test": 2000,
+ "classes": [
+  "approve",
+  "review",
+  "reject"
+ ]
+}

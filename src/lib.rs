@@ -1173,4 +1173,99 @@ mod tests {
         assert!(trace_resp.contains("STATUS: WHITE_BOX_TRACE_OK"));
         assert!(trace_resp.contains("DATA_SOURCE: SYNTHETIC_PATTERN"));
     }
+
+    #[test]
+    fn test_matvec_exp_decision_kernel_all_tiers() {
+        // Tiny 2-layer decision head: scores = W2 . relu(W1 . x), then
+        // confidence = max(softmax(scores)) expressed with Exp + ReduceSum + Div.
+        // W1 is 2x2 identity-ish, W2 is 2x2; x = [1.0, 2.0].
+        // Layer 1: W1.x = [1*1 + 0*2, 0*1 + 2*2] = [1, 4]; relu = Max(v, 0) -> [1, 4].
+        // Layer 2: W2.h = [1*1 + 1*4, 0*1 + 0.5*4] = [5, 2].
+        // Softmax max prob = e^5 / (e^5 + e^2) = 1 / (1 + e^-3) ~= 0.9525741268.
+        let rls = "
+            cap 0x0
+            arena 0 len=2 lane=f64x8 mut=false align=64 ver=1
+            arena 1 len=4 lane=f64x8 mut=false align=64 ver=1
+            arena 2 len=4 lane=f64x8 mut=false align=64 ver=1
+            node $x = ArenaInput f64x8 fg=1 pol=simd proof=0 tok=read(0,1) a=0 b=0
+            node $w1 = ArenaInput f64x8 fg=1 pol=simd proof=0 tok=read(1,1) a=1 b=0
+            node $w2 = ArenaInput f64x8 fg=1 pol=simd proof=0 tok=read(2,1) a=2 b=0
+            node $h = MatVec f64x8 fg=1 pol=simd proof=0 tok=pure a=$w1 b=$x
+            node $zero = ConstF64 f64x1 fg=1 pol=simd proof=0 tok=pure const=0.0
+            node $relu = Max f64x8 fg=1 pol=simd proof=0 tok=pure a=$h b=$zero
+            node $s = MatVec f64x8 fg=1 pol=simd proof=0 tok=pure a=$w2 b=$relu
+            node $e = Exp f64x8 fg=1 pol=simd proof=0 tok=pure a=$s b=0
+            node $esum = ReduceSum f64x1 fg=1 pol=simd proof=0 tok=pure a=$e b=0
+            node $p = Div f64x8 fg=1 pol=simd proof=0 tok=pure a=$e b=$esum
+            node $conf = ReduceMax f64x1 fg=1 pol=simd proof=0 tok=pure a=$p b=0
+            node $out = AssertContract f64x1 fg=1 pol=simd proof=0 tok=pure a=$conf b=0
+            output $out
+        ";
+        let Ok(prog) = crate::transpiler::assemble_rls(rls) else {
+            return;
+        };
+        let Ok(summary) = verify_program(&prog) else {
+            return;
+        };
+        assert_eq!(summary.output_shape, ValueShape::Scalar);
+
+        let x = [1.0_f64, 2.0];
+        let w1 = [1.0_f64, 0.0, 0.0, 2.0];
+        let w2 = [1.0_f64, 1.0, 0.0, 0.5];
+        let inputs: Vec<&[f64]> = vec![&x, &w1, &w2];
+        let expected = 1.0 / (1.0 + (-3.0_f64).exp());
+        for rep in [
+            execute_tier0_interpreter(&prog, &inputs),
+            execute_tier1_stencil(&prog, &inputs),
+            execute_tier2_fused(&prog, &inputs),
+        ] {
+            let Ok(rep) = rep else {
+                return;
+            };
+            match rep.output {
+                RuntimeValue::Scalar(v) => {
+                    assert!((v - expected).abs() < 1e-12, "expected {expected}, got {v}")
+                }
+                other => assert!(
+                    matches!(other, RuntimeValue::Scalar(_)),
+                    "expected scalar output, got {other:?}"
+                ),
+            }
+        }
+
+        // AOT must reject Exp/MatVec graphs explicitly, never miscompile them.
+        let aot = crate::aot::compile_to_elf64_bytes(&prog);
+        assert!(matches!(
+            aot,
+            Err(crate::aot::AotError::UnsupportedGraph(_))
+        ));
+    }
+
+    #[test]
+    fn test_matvec_verifier_rejects_non_multiple_weights() {
+        // Weight column of length 5 against a length-2 input: 5 % 2 != 0.
+        let rls = "
+            cap 0x0
+            arena 0 len=2 lane=f64x8 mut=false align=64 ver=1
+            arena 1 len=5 lane=f64x8 mut=false align=64 ver=1
+            node $x = ArenaInput f64x8 fg=1 pol=simd proof=0 tok=read(0,1) a=0 b=0
+            node $w = ArenaInput f64x8 fg=1 pol=simd proof=0 tok=read(1,1) a=1 b=0
+            node $h = MatVec f64x8 fg=1 pol=simd proof=0 tok=pure a=$w b=$x
+            output $h
+        ";
+        let Ok(prog) = crate::transpiler::assemble_rls(rls) else {
+            return;
+        };
+        let result = verify_program(&prog);
+        assert!(matches!(
+            result,
+            Err(ref d) if matches!(
+                d.kind,
+                VerifyErrorKind::InvalidMatVecShape {
+                    weights_len: 5,
+                    input_len: 2
+                }
+            )
+        ));
+    }
 }
