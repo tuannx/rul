@@ -988,6 +988,7 @@ fn format_opcode(op: Opcode) -> &'static str {
         Opcode::ReduceMax => "ReduceMax",
         Opcode::Gather => "Gather",
         Opcode::MatVec => "MatVec",
+        Opcode::MatVecT => "MatVecT",
         Opcode::RingEnqueue => "RingEnqueue",
         Opcode::AssertContract => "AssertContract",
     }
@@ -1016,6 +1017,7 @@ fn parse_opcode(line_no: usize, raw: &str) -> Result<Opcode, RlsError> {
         "ReduceMax" => Opcode::ReduceMax,
         "Gather" => Opcode::Gather,
         "MatVec" => Opcode::MatVec,
+        "MatVecT" => Opcode::MatVecT,
         "RingEnqueue" => Opcode::RingEnqueue,
         "AssertContract" => Opcode::AssertContract,
         _ => {

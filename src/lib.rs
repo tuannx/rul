@@ -1278,6 +1278,38 @@ mod tests {
     }
 
     #[test]
+    fn test_matvect_transposed_product() {
+        // W row-major 2x3 = [[1,2,3],[4,5,6]], x = [1, 0.5] (one weight per row)
+        // MatVecT: out[c] = W[0][c]*1 + W[1][c]*0.5 = [3, 4.5, 6]; sum = 13.5
+        let rls = "
+            cap 0x0
+            arena 0 len=6 lane=f64x8 mut=false align=64 ver=1
+            arena 1 len=2 lane=f64x8 mut=false align=64 ver=1
+            node $w = ArenaInput f64x8 fg=1 pol=simd proof=0 tok=read(0,1) a=0 b=0
+            node $x = ArenaInput f64x8 fg=1 pol=simd proof=0 tok=read(1,1) a=1 b=0
+            node $o = MatVecT f64x8 fg=1 pol=simd proof=0 tok=pure a=$w b=$x
+            node $s = ReduceSum f64x1 fg=1 pol=simd proof=0 tok=pure a=$o b=0
+            output $s
+        ";
+        let Ok(prog) = crate::transpiler::assemble_rls(rls) else {
+            return;
+        };
+        assert!(verify_program(&prog).is_ok());
+        let w = [1.0_f64, 2.0, 3.0, 4.0, 5.0, 6.0];
+        let x = [1.0_f64, 0.5];
+        let Ok(rep) = execute_tier0_interpreter(&prog, &[&w, &x]) else {
+            return;
+        };
+        match rep.output {
+            RuntimeValue::Scalar(v) => assert!((v - 13.5).abs() < 1e-12, "got {v}"),
+            other => assert!(
+                matches!(other, RuntimeValue::Scalar(_)),
+                "expected scalar output, got {other:?}"
+            ),
+        }
+    }
+
+    #[test]
     fn test_matvec_verifier_rejects_non_multiple_weights() {
         // Weight column of length 5 against a length-2 input: 5 % 2 != 0.
         let rls = "

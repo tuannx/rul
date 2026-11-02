@@ -262,6 +262,7 @@ pub fn compute_live_nodes(program: &RulProgram) -> Vec<bool> {
             | Opcode::SelectZero
             | Opcode::FilterCompact
             | Opcode::MatVec
+            | Opcode::MatVecT
             | Opcode::Gather => {
                 if let Some(a) = live.get_mut(frame.in_a as usize) {
                     *a = true;
@@ -520,6 +521,31 @@ fn eval_node_tier0<'a>(
                         acc += wi * xi;
                     }
                     out.push(acc);
+                }
+                *intermediate_bytes = intermediate_bytes.saturating_add(out.len() * 8);
+                Ok(EvalValue::ColumnF64(Cow::Owned(out)))
+            } else {
+                Err(ExecError::InvalidOperandState(node_idx))
+            }
+        }
+        Opcode::MatVecT => {
+            let w_val = values
+                .get(frame.in_a as usize)
+                .ok_or(ExecError::InvalidOperandState(node_idx))?;
+            let x_val = values
+                .get(frame.in_b as usize)
+                .ok_or(ExecError::InvalidOperandState(node_idx))?;
+            if let (EvalValue::ColumnF64(w), EvalValue::ColumnF64(x)) = (w_val, x_val) {
+                let rows = x.len();
+                if rows == 0 || w.len() % rows != 0 {
+                    return Err(ExecError::InvalidOperandState(node_idx));
+                }
+                let cols = w.len() / rows;
+                let mut out = vec![0.0f64; cols];
+                for (row, &xr) in w.chunks_exact(cols).zip(x.iter()) {
+                    for (o, &wi) in out.iter_mut().zip(row.iter()) {
+                        *o += wi * xr;
+                    }
                 }
                 *intermediate_bytes = intermediate_bytes.saturating_add(out.len() * 8);
                 Ok(EvalValue::ColumnF64(Cow::Owned(out)))

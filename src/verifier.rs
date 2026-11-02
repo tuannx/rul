@@ -580,7 +580,7 @@ fn verify_node_semantics(
                 origin_arena: None,
             })
         }
-        Opcode::MatVec => {
+        Opcode::MatVec | Opcode::MatVecT => {
             let w_meta = get_prior_meta(node_idx, frame.in_a, metas)?;
             let x_meta = get_prior_meta(node_idx, frame.in_b, metas)?;
             if w_meta.elem != ElemType::F64 || x_meta.elem != ElemType::F64 {

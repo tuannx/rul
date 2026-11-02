@@ -73,6 +73,11 @@ pub enum Opcode {
     /// Dense matrix-vector product (`out[r] = sum_c W[r * C + c] * x[c]`, where
     /// `in_a` is a row-major `R x C` matrix column and `in_b` is a length-`C` vector).
     MatVec = 0x24,
+    /// Transposed matrix-vector product over a row-major matrix
+    /// (`out[c] = sum_r W[r * C + c] * x[r]`, where `in_a` is an `R x C`
+    /// matrix column and `in_b` is a length-`R` vector). Lets consumers
+    /// read append-friendly row-major caches without a transpose copy.
+    MatVecT = 0x25,
     /// Enqueue scalar/column output to a hardware NIC ring (requires [`CAP_NET_RING`]).
     RingEnqueue = 0x30,
     /// Output contract assertion checking non-NaN and finite bounds on `in_a`.
@@ -107,6 +112,7 @@ impl Opcode {
             0x22 => Ok(Self::ReduceMax),
             0x23 => Ok(Self::Gather),
             0x24 => Ok(Self::MatVec),
+            0x25 => Ok(Self::MatVecT),
             0x30 => Ok(Self::RingEnqueue),
             0x40 => Ok(Self::AssertContract),
             other => Err(RulFormatError::UnknownOpcode(other)),
