@@ -238,6 +238,7 @@ pub fn compute_live_nodes(program: &RulProgram) -> Vec<bool> {
             | Opcode::ReduceSum
             | Opcode::ReduceMax
             | Opcode::Exp
+            | Opcode::Rsqrt
             | Opcode::RingEnqueue
             | Opcode::AssertContract => {
                 if let Some(a) = live.get_mut(frame.in_a as usize) {
@@ -480,17 +481,22 @@ fn eval_node_tier0<'a>(
                 Err(ExecError::InvalidOperandState(node_idx))
             }
         }
-        Opcode::Exp => {
+        Opcode::Exp | Opcode::Rsqrt => {
             let src = values
                 .get(frame.in_a as usize)
                 .ok_or(ExecError::InvalidOperandState(node_idx))?;
+            let f: fn(f64) -> f64 = if frame.opcode == Opcode::Exp {
+                f64::exp
+            } else {
+                |x: f64| 1.0 / x.sqrt()
+            };
             match src {
                 EvalValue::ColumnF64(col) => {
                     *intermediate_bytes = intermediate_bytes.saturating_add(col.len() * 8);
-                    let out: Vec<f64> = col.iter().map(|&x| x.exp()).collect();
+                    let out: Vec<f64> = col.iter().map(|&x| f(x)).collect();
                     Ok(EvalValue::ColumnF64(Cow::Owned(out)))
                 }
-                EvalValue::Scalar(s) => Ok(EvalValue::Scalar(s.exp())),
+                EvalValue::Scalar(s) => Ok(EvalValue::Scalar(f(*s))),
                 _ => Err(ExecError::InvalidOperandState(node_idx)),
             }
         }

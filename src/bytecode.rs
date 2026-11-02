@@ -60,6 +60,8 @@ pub enum Opcode {
     CmpEq = 0x19,
     /// Elementwise natural exponential (`out[i] = exp(in_a[i])`).
     Exp = 0x1A,
+    /// Elementwise reciprocal square root (`out[i] = 1 / sqrt(in_a[i])`).
+    Rsqrt = 0x1B,
     /// Stream compaction filtering elements of `in_b` where mask `in_a` is true.
     FilterCompact = 0x20,
     /// Horizontal sum reduction of column `in_a` to a scalar `f64`.
@@ -99,6 +101,7 @@ impl Opcode {
             0x18 => Ok(Self::CmpLt),
             0x19 => Ok(Self::CmpEq),
             0x1A => Ok(Self::Exp),
+            0x1B => Ok(Self::Rsqrt),
             0x20 => Ok(Self::FilterCompact),
             0x21 => Ok(Self::ReduceSum),
             0x22 => Ok(Self::ReduceMax),

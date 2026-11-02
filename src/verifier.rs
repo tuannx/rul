@@ -563,7 +563,7 @@ fn verify_node_semantics(
                 origin_arena: None,
             })
         }
-        Opcode::Exp => {
+        Opcode::Exp | Opcode::Rsqrt => {
             let src_meta = get_prior_meta(node_idx, frame.in_a, metas)?;
             if src_meta.elem != ElemType::F64 {
                 return Err(VerifyDiagnostic {

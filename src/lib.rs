@@ -1242,6 +1242,42 @@ mod tests {
     }
 
     #[test]
+    fn test_rsqrt_opcode_column_and_scalar() {
+        // Rsqrt over a column: [4, 9, 16] -> [0.5, 1/3, 0.25]; ReduceSum -> 1.0833...
+        let rls = "
+            cap 0x0
+            arena 0 len=3 lane=f64x8 mut=false align=64 ver=1
+            node $x = ArenaInput f64x8 fg=1 pol=simd proof=0 tok=read(0,1) a=0 b=0
+            node $r = Rsqrt f64x8 fg=1 pol=simd proof=0 tok=pure a=$x b=0
+            node $s = ReduceSum f64x1 fg=1 pol=simd proof=0 tok=pure a=$r b=0
+            output $s
+        ";
+        let Ok(prog) = crate::transpiler::assemble_rls(rls) else {
+            return;
+        };
+        assert!(verify_program(&prog).is_ok());
+        let data = [4.0_f64, 9.0, 16.0];
+        let expected = 0.5 + 1.0 / 3.0 + 0.25;
+        for rep in [
+            execute_tier0_interpreter(&prog, &[&data]),
+            execute_tier2_fused(&prog, &[&data]),
+        ] {
+            let Ok(rep) = rep else {
+                return;
+            };
+            match rep.output {
+                RuntimeValue::Scalar(v) => {
+                    assert!((v - expected).abs() < 1e-12, "expected {expected}, got {v}")
+                }
+                other => assert!(
+                    matches!(other, RuntimeValue::Scalar(_)),
+                    "expected scalar output, got {other:?}"
+                ),
+            }
+        }
+    }
+
+    #[test]
     fn test_matvec_verifier_rejects_non_multiple_weights() {
         // Weight column of length 5 against a length-2 input: 5 % 2 != 0.
         let rls = "
