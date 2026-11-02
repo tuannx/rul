@@ -237,6 +237,7 @@ pub fn compute_live_nodes(program: &RulProgram) -> Vec<bool> {
             Opcode::ArenaSlice
             | Opcode::ReduceSum
             | Opcode::ReduceMax
+            | Opcode::Exp
             | Opcode::RingEnqueue
             | Opcode::AssertContract => {
                 if let Some(a) = live.get_mut(frame.in_a as usize) {
@@ -259,6 +260,7 @@ pub fn compute_live_nodes(program: &RulProgram) -> Vec<bool> {
             | Opcode::CmpEq
             | Opcode::SelectZero
             | Opcode::FilterCompact
+            | Opcode::MatVec
             | Opcode::Gather => {
                 if let Some(a) = live.get_mut(frame.in_a as usize) {
                     *a = true;
@@ -474,6 +476,47 @@ fn eval_node_tier0<'a>(
             if let EvalValue::ColumnF64(col) = src {
                 let max = col.iter().copied().fold(f64::NEG_INFINITY, f64::max);
                 Ok(EvalValue::Scalar(max))
+            } else {
+                Err(ExecError::InvalidOperandState(node_idx))
+            }
+        }
+        Opcode::Exp => {
+            let src = values
+                .get(frame.in_a as usize)
+                .ok_or(ExecError::InvalidOperandState(node_idx))?;
+            match src {
+                EvalValue::ColumnF64(col) => {
+                    *intermediate_bytes = intermediate_bytes.saturating_add(col.len() * 8);
+                    let out: Vec<f64> = col.iter().map(|&x| x.exp()).collect();
+                    Ok(EvalValue::ColumnF64(Cow::Owned(out)))
+                }
+                EvalValue::Scalar(s) => Ok(EvalValue::Scalar(s.exp())),
+                _ => Err(ExecError::InvalidOperandState(node_idx)),
+            }
+        }
+        Opcode::MatVec => {
+            let w_val = values
+                .get(frame.in_a as usize)
+                .ok_or(ExecError::InvalidOperandState(node_idx))?;
+            let x_val = values
+                .get(frame.in_b as usize)
+                .ok_or(ExecError::InvalidOperandState(node_idx))?;
+            if let (EvalValue::ColumnF64(w), EvalValue::ColumnF64(x)) = (w_val, x_val) {
+                let cols = x.len();
+                if cols == 0 || w.len() % cols != 0 {
+                    return Err(ExecError::InvalidOperandState(node_idx));
+                }
+                let rows = w.len() / cols;
+                let mut out = Vec::with_capacity(rows);
+                for row in w.chunks_exact(cols) {
+                    let mut acc = 0.0f64;
+                    for (&wi, &xi) in row.iter().zip(x.iter()) {
+                        acc += wi * xi;
+                    }
+                    out.push(acc);
+                }
+                *intermediate_bytes = intermediate_bytes.saturating_add(out.len() * 8);
+                Ok(EvalValue::ColumnF64(Cow::Owned(out)))
             } else {
                 Err(ExecError::InvalidOperandState(node_idx))
             }

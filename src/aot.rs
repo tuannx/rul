@@ -145,6 +145,11 @@ pub fn compile_to_elf64_bytes(
             Opcode::Gather => {
                 has_gather = true;
             }
+            Opcode::Exp | Opcode::MatVec => {
+                return Err(AotError::UnsupportedGraph(
+                    "Exp/MatVec are not supported by the AOT compiler yet; execute via Tier 0/1/2",
+                ));
+            }
             _ => {}
         }
     }
@@ -575,6 +580,11 @@ fn emit_x86_64_machine_code(
                     code.extend_from_slice(&[0xC5, 0xFD, 0x54, 0xC1]);
                     emit_store_ymm0_rbp(&mut code, disp);
                 }
+                Opcode::Exp | Opcode::MatVec => {
+                    return Err(AotError::UnsupportedGraph(
+                        "Exp/MatVec are not supported by the AOT compiler yet; execute via Tier 0/1/2",
+                    ));
+                }
                 Opcode::Gather
                 | Opcode::ReduceSum
                 | Opcode::ReduceMax
@@ -793,6 +803,11 @@ fn emit_x86_64_machine_code(
                 // movsd xmm0, [rax + rdx * 8]
                 code.extend_from_slice(&[0xF2, 0x0F, 0x10, 0x04, 0xD0]);
                 emit_store_xmm0_rbp(&mut code, disp);
+            }
+            Opcode::Exp | Opcode::MatVec => {
+                return Err(AotError::UnsupportedGraph(
+                    "Exp/MatVec are not supported by the AOT compiler yet; execute via Tier 0/1/2",
+                ));
             }
             Opcode::ReduceSum
             | Opcode::ReduceMax
@@ -1038,6 +1053,7 @@ fn compute_live_nodes(program: &RulProgram) -> Vec<bool> {
             Opcode::ArenaSlice
             | Opcode::ReduceSum
             | Opcode::ReduceMax
+            | Opcode::Exp
             | Opcode::RingEnqueue
             | Opcode::AssertContract => {
                 if let Some(a) = live.get_mut(frame.in_a as usize) {
@@ -1060,6 +1076,7 @@ fn compute_live_nodes(program: &RulProgram) -> Vec<bool> {
             | Opcode::CmpEq
             | Opcode::SelectZero
             | Opcode::FilterCompact
+            | Opcode::MatVec
             | Opcode::Gather => {
                 if let Some(a) = live.get_mut(frame.in_a as usize) {
                     *a = true;
